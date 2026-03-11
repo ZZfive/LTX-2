@@ -19,11 +19,11 @@ DEFAULT_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
 class LatentTools(Protocol):
     """
-    Tools for building latent states.
+    Tools for building latent states. 用于构建潜向量状态的工具。
     """
 
-    patchifier: Patchifier
-    target_shape: VideoLatentShape | AudioLatentShape
+    patchifier: Patchifier  # 用于将隐空间张量转换为 patch 序列和将 patch 序列转换为隐空间张量
+    target_shape: VideoLatentShape | AudioLatentShape  # 目标隐空间形状
 
     def create_initial_state(
         self,
@@ -85,17 +85,17 @@ class LatentTools(Protocol):
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True)  # 开启冻结，实例化后不可修改
 class VideoLatentTools(LatentTools):
     """
-    Tools for building video latent states.
+    Tools for building video latent states. 用于构建视频隐空间状态的工具。
     """
 
-    patchifier: VideoLatentPatchifier
-    target_shape: VideoLatentShape
-    fps: float
-    scale_factors: SpatioTemporalScaleFactors = DEFAULT_SCALE_FACTORS
-    causal_fix: bool = True
+    patchifier: VideoLatentPatchifier  # 用于将隐空间张量转换为 patch 序列和将 patch 序列转换为隐空间张量
+    target_shape: VideoLatentShape  # 目标隐空间形状
+    fps: float  # 帧率
+    scale_factors: SpatioTemporalScaleFactors = DEFAULT_SCALE_FACTORS  # 时空缩放因子
+    causal_fix: bool = True  # 因果修复
 
     def create_initial_state(
         self,

@@ -4,7 +4,7 @@ from typing import NamedTuple
 import torch
 
 
-class VideoPixelShape(NamedTuple):
+class VideoPixelShape(NamedTuple):  # 表示视频像素空间尺寸
     """
     Shape of the tensor representing the video pixel array. Assumes BGR channel format.
     """
@@ -16,7 +16,7 @@ class VideoPixelShape(NamedTuple):
     fps: float
 
 
-class SpatioTemporalScaleFactors(NamedTuple):
+class SpatioTemporalScaleFactors(NamedTuple):  # 表示时空缩放因子
     """
     Describes the spatiotemporal downscaling between decoded video space and
     the corresponding VAE latent grid.
@@ -92,10 +92,10 @@ class VideoLatentShape(NamedTuple):
             frames=(self.frames - 1) * scale_factors.time + 1,
             height=self.height * scale_factors.height,
             width=self.width * scale_factors.width,
-        )
+        )  # 从隐空间映射回像素空间
 
 
-class AudioLatentShape(NamedTuple):
+class AudioLatentShape(NamedTuple):  # 表示音频隐空间尺寸
     """
     Shape of audio in VAE latent space: (batch, channels, frames, mel_bins).
     mel_bins is the number of frequency bins from the mel-spectrogram encoding.
@@ -131,16 +131,16 @@ class AudioLatentShape(NamedTuple):
         duration: float,
         channels: int = 8,
         mel_bins: int = 16,
-        sample_rate: int = 16000,
-        hop_length: int = 160,
-        audio_latent_downsample_factor: int = 4,
+        sample_rate: int = 16000,  # 音频采样率（Hz），此处每秒 16000 个采样点
+        hop_length: int = 160,  # STFT 的帧移，即每帧之间间隔采样点数量，此处间隔为 160 个采样点
+        audio_latent_downsample_factor: int = 4,  # 音频 VAE 在时间轴上的下采样倍率
     ) -> "AudioLatentShape":
         latents_per_second = float(sample_rate) / float(hop_length) / float(audio_latent_downsample_factor)
 
         return AudioLatentShape(
             batch=batch,
             channels=channels,
-            frames=round(duration * latents_per_second),
+            frames=round(duration * latents_per_second),  # 计算音频帧数，此处 duration 为音频时长（秒），latents_per_second 为每秒音频帧数
             mel_bins=mel_bins,
         )
 
@@ -191,6 +191,14 @@ class LatentState:
         clean_latent: Initial state of the latent before denoising, may include conditioning latents.
         attention_mask: Optional 2D self-attention mask of shape (B, T, T). Values in [0, 1] where 1 = full attention,
             0 = no attention. None means full attention everywhere. Built incrementally by conditioning items.
+    
+    扩散去噪过程中潜向量状态。
+    属性：
+        latent: 当前噪声隐空间张量，表示当前正在去噪的隐空间张量。
+        denoise_mask: 去噪掩码，表示每个 token 的去噪强度，1 表示完全去噪，0 表示不去噪。
+        positions: 每个隐空间元素的位置索引，用于位置嵌入。
+        clean_latent: 去噪前的隐空间张量，可能包含条件隐空间。
+        attention_mask: 可选的 2D 自注意力掩码，形状为 (B, T, T)。值在 [0, 1] 之间，1 表示完全注意力，0 表示没有注意力。None 表示全注意力。由条件项逐步构建。
     """
 
     latent: torch.Tensor

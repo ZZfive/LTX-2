@@ -25,9 +25,9 @@ def to_velocity(
     calc_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Convert the sample and its denoised version to velocity.
+    Convert the sample and its denoised version to velocity. 基于样本及其去噪版本计算速度。
     Returns:
-        Velocity
+        Velocity 速度
     """
     if isinstance(sigma, torch.Tensor):
         sigma = sigma.to(calc_dtype).item()
@@ -43,9 +43,9 @@ def to_denoised(
     calc_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Convert the sample and its denoising velocity to denoised sample.
+    Convert the sample and its denoising velocity to denoised sample. 基于样本及其去噪速度计算去噪样本。
     Returns:
-        Denoised sample
+        Denoised sample 去噪样本
     """
     if isinstance(sigma, torch.Tensor):
         sigma = sigma.to(calc_dtype)
