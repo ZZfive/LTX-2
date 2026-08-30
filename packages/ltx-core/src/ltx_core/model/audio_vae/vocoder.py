@@ -1,4 +1,6 @@
+import contextlib
 import math
+from collections.abc import Iterator
 from typing import List
 
 import einops
@@ -7,10 +9,30 @@ import torch.nn.functional as F
 from torch import nn
 
 from ltx_core.model.audio_vae.resnet import LRELU_SLOPE, ResBlock1
+from ltx_core.model.disposable import Disposable
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
     return int((kernel_size * dilation - dilation) / 2)
+
+
+@contextlib.contextmanager
+def _module_in_fp32(module: nn.Module, *, enabled: bool) -> Iterator[None]:
+    """Temporarily cast *module* to float32, restoring its original dtype on exit.
+    Used for the MPS vocoder path where fp32 autocast is unavailable, so the
+    weights must be materialized in float32 for the forward pass. Restores to the
+    module's original weight dtype (captured here), not the input dtype. When
+    *enabled* is False this is a no-op, so callers can wrap unconditionally.
+    """
+    if not enabled:
+        yield
+        return
+    module_dtype = next(module.parameters()).dtype
+    module.float()
+    try:
+        yield
+    finally:
+        module.to(module_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +290,7 @@ class AMPBlock1(nn.Module):
         return x
 
 
-class Vocoder(torch.nn.Module):
+class Vocoder(torch.nn.Module, Disposable):
     """
     Vocoder model for synthesizing audio from Mel spectrograms.
     Args:
@@ -494,12 +516,14 @@ class MelSTFT(nn.Module):
         return log_mel, magnitude, phase, energy
 
 
-class VocoderWithBWE(nn.Module):
+class VocoderWithBWE(nn.Module, Disposable):
     """Vocoder with bandwidth extension (BWE) upsampling.
     Chains a mel-to-wav vocoder with a BWE module that upsamples the output
     to a higher sample rate. The BWE computes a mel spectrogram from the
     vocoder output, runs it through a second generator to predict a residual,
     and adds it to a sinc-resampled skip connection.
+    The forward pass runs in fp32 via autocast to avoid bfloat16 accumulation
+    errors that degrade spectral metrics by 40-90%.
     """
 
     def __init__(
@@ -548,28 +572,59 @@ class VocoderWithBWE(nn.Module):
 
     def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
         """Run the full vocoder + BWE forward pass.
+        Runs in float32 regardless of weight or input dtype. bfloat16 arithmetic
+        causes 40-90% spectral metric degradation due to accumulation errors
+        compounding through 108 sequential convolutions in the BigVGAN v2 architecture.
         Args:
             mel_spec: Mel spectrogram of shape (B, 2, T, mel_bins) for stereo
                       or (B, T, mel_bins) for mono. Same format as Vocoder.forward.
         Returns:
             Waveform tensor of shape (B, out_channels, T_out) clipped to [-1, 1].
         """
-        x = self.vocoder(mel_spec)
-        _, _, length_low_rate = x.shape
-        output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate
+        input_dtype = mel_spec.dtype
+        # Run the entire forward pass in fp32.  bfloat16 accumulation errors
+        # compound through 108 sequential convolutions and degrade spectral
+        # metrics (mel_l1, MRSTFT) by 40-90% while perceptual quality (CDPAM)
+        # is unaffected.  fp32 eliminates this degradation.
+        # On CUDA/CPU we use autocast(dtype=float32) rather than self.float()
+        # because it upcasts bf16 weights per-op at kernel level, avoiding the
+        # temporary memory spike of self.float() / self.to(original_dtype).
+        # Benchmarked on H100 (128.5M-param model):
+        #   autocast fp32: +70 MB peak VRAM, 123 ms  (vs 482 MB / 95 ms for bf16)
+        #   model.float(): +324 MB peak VRAM, 149 ms
+        # Tested: both approaches produce bit-identical output.
+        # MPS autocast does not upcast conv weights to fp32 (it only supports
+        # lower-precision autocast dtypes), which would leave the float32 input
+        # running against bf16 conv weights and raise a dtype mismatch. There we
+        # fall back to materializing the weights in fp32 for the pass (bit-identical
+        # per the note above; the memory spike is negligible for this small model).
+        # The vocoder is normally built in fp32 on MPS, so this fallback is then a
+        # no-op -- it only triggers if a bf16 module is run on MPS directly.
+        device_type = mel_spec.device.type
+        module_dtype = next(self.parameters()).dtype
+        fp32_ctx = (
+            _module_in_fp32(self, enabled=module_dtype != torch.float32)
+            if device_type == "mps"
+            else torch.autocast(device_type=device_type, dtype=torch.float32)
+        )
 
-        # Pad to multiple of hop_length for exact mel frame count
-        remainder = length_low_rate % self.hop_length
-        if remainder != 0:
-            x = F.pad(x, (0, self.hop_length - remainder))
+        with fp32_ctx:
+            x = self.vocoder(mel_spec.float())
+            _, _, length_low_rate = x.shape
+            output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate
 
-        # Compute mel spectrogram from vocoder output: (B, C, n_mels, T_frames)
-        mel = self._compute_mel(x)
+            # Pad to multiple of hop_length for exact mel frame count
+            remainder = length_low_rate % self.hop_length
+            if remainder != 0:
+                x = F.pad(x, (0, self.hop_length - remainder))
 
-        # Vocoder.forward expects (B, C, T, mel_bins) — transpose before calling bwe_generator
-        mel_for_bwe = mel.transpose(2, 3)  # (B, C, T_frames, mel_bins)
-        residual = self.bwe_generator(mel_for_bwe)
-        skip = self.resampler(x)
-        assert residual.shape == skip.shape, f"residual {residual.shape} != skip {skip.shape}"
+            # Compute mel spectrogram from vocoder output: (B, C, n_mels, T_frames)
+            mel = self._compute_mel(x)
 
-        return torch.clamp(residual + skip, -1, 1)[..., :output_length]
+            # Vocoder.forward expects (B, C, T, mel_bins) — transpose before calling bwe_generator
+            mel_for_bwe = mel.transpose(2, 3)  # (B, C, T_frames, mel_bins)
+            residual = self.bwe_generator(mel_for_bwe)
+            skip = self.resampler(x)
+            assert residual.shape == skip.shape, f"residual {residual.shape} != skip {skip.shape}"
+
+            return torch.clamp(residual + skip, -1, 1)[..., :output_length].to(input_dtype)

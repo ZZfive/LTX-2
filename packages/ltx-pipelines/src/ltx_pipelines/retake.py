@@ -1,153 +1,52 @@
 from __future__ import annotations
 
-import argparse
 import logging
-from collections.abc import Iterator
-from dataclasses import dataclass
 
 import torch
 
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.components.patchifiers import get_pixel_coords
-from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
-from ltx_core.conditioning import ConditioningItem
+from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
-from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
-from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
-from ltx_core.model.video_vae import decode_video as vae_decode_video
+from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import CompilationConfig
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.tools import LatentTools
 from ltx_core.types import (
-    Audio,
-    AudioLatentShape,
-    LatentState,
     SpatioTemporalScaleFactors,
     VideoPixelShape,
 )
-from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.args import QuantizationAction
-from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, detect_params
+from ltx_pipelines.utils.args import video_editing_arg_parser
+from ltx_pipelines.utils.blocks import (
+    AudioConditioner,
+    AudioDecoder,
+    DiffusionStage,
+    ImageConditioner,
+    PromptEncoder,
+    VideoDecoder,
+)
+from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, detect_params
+from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
-    cleanup_memory,
-    encode_prompts,
+    audio_latent_from_file,
+    ensure_tiling_config,
     get_device,
-    multi_modal_guider_denoising_func,
-    noise_audio_state,
-    noise_video_state,
-    simple_denoising_func,
+    tiling_scale_factors_for_vae,
+    video_latent_from_file,
 )
 from ltx_pipelines.utils.media_io import (
-    decode_audio_from_file,
+    HDRColorSpace,
     encode_video,
     get_videostream_metadata,
-    load_video_conditioning,
+    is_exr_dir,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
 )
-from ltx_pipelines.utils.samplers import euler_denoising_loop
-from ltx_pipelines.utils.types import PipelineComponents
-
-device = get_device()
-
-
-def _encode_video_for_retake(
-    video_encoder: torch.nn.Module,
-    video_path: str,
-    output_shape: VideoPixelShape,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Load video and encode to latents."""
-    pixel_video = load_video_conditioning(
-        video_path=video_path,
-        height=output_shape.height,
-        width=output_shape.width,
-        frame_cap=output_shape.frames,
-        dtype=dtype,
-        device=device,
-    )  # (1, C, F, H, W)
-    return video_encoder(pixel_video)
-
-
-def _encode_audio_for_retake(
-    audio_encoder: torch.nn.Module,
-    waveform: torch.Tensor,
-    waveform_sr: int,
-    output_shape: VideoPixelShape,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Encode audio to latents and trim/pad to match output_shape."""
-    waveform_batch = waveform.unsqueeze(0) if waveform.dim() == 2 else waveform
-    initial_audio_latent = vae_encode_audio(
-        Audio(waveform=waveform_batch.to(dtype), sampling_rate=waveform_sr), audio_encoder, None
-    )
-    expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
-    expected_frames = expected_audio_shape.frames
-    actual_frames = initial_audio_latent.shape[2]
-    if actual_frames > expected_frames:
-        initial_audio_latent = initial_audio_latent[:, :, :expected_frames, :]
-    elif actual_frames < expected_frames:
-        pad = torch.zeros(
-            initial_audio_latent.shape[0],
-            initial_audio_latent.shape[1],
-            expected_frames - actual_frames,
-            initial_audio_latent.shape[3],
-            device=initial_audio_latent.device,
-            dtype=initial_audio_latent.dtype,
-        )
-        initial_audio_latent = torch.cat([initial_audio_latent, pad], dim=2)
-    return initial_audio_latent
-
-
-# ---------------------------------------------------------------------------
-# Custom conditioning item: temporal region mask
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class TemporalRegionMask:
-    """Conditioning item that sets ``denoise_mask = 0`` outside a time range
-    and ``1`` inside, so only the specified temporal region is regenerated.
-    Uses ``start_time`` and ``end_time`` in seconds. Works in *patchified*
-    (token) space using the patchifier's ``get_patch_grid_bounds``: for video
-    coords are latent frame indices (converted from seconds via ``fps``), for
-    audio coords are already in seconds.
-    """
-
-    start_time: float  # seconds, inclusive
-    end_time: float  # seconds, exclusive
-    fps: float
-
-    def apply_to(self, latent_state: LatentState, latent_tools: LatentTools) -> LatentState:
-        coords = latent_tools.patchifier.get_patch_grid_bounds(
-            latent_tools.target_shape, device=latent_state.denoise_mask.device
-        )
-        # coords: [B, 3, N, 2] (video) or [B, 1, N, 2] (audio); temporal dim is index 0
-        if coords.shape[1] == 1:
-            # Audio: patchifier returns seconds
-            t_start = coords[:, 0, :, 0]  # [B, N]
-            t_end = coords[:, 0, :, 1]  # [B, N]
-            in_region = (t_end > self.start_time) & (t_start < self.end_time)
-        else:
-            # Video: get pixel bounds per patch, find patches for start/end frame, read latent from coords.
-            scale_factors = getattr(latent_tools, "scale_factors", SpatioTemporalScaleFactors.default())
-            pixel_bounds = get_pixel_coords(coords, scale_factors, causal_fix=getattr(latent_tools, "causal_fix", True))
-            timestamp_bounds = pixel_bounds[0, 0] / self.fps
-            t_start, t_end = timestamp_bounds.unbind(dim=-1)
-            in_region = (t_end > self.start_time) & (t_start < self.end_time)
-        state = latent_state.clone()
-        mask_val = in_region.to(state.denoise_mask.dtype)
-        if state.denoise_mask.dim() == 3:
-            mask_val = mask_val.unsqueeze(-1)
-        state.denoise_mask.copy_(mask_val)
-        return state
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
+from ltx_pipelines.utils.model_paths import ModelPaths
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
 
 class RetakePipeline:
@@ -168,36 +67,87 @@ class RetakePipeline:
         Target device (default: CUDA if available).
     quantization : QuantizationPolicy | None
         Optional quantization policy for the transformer.
+    distilled : bool
+        Set to ``True`` if using distilled model or passing distillation
+        lora with full model. If set to ``True``, distilled sigma schedule
+        (``DISTILLED_SIGMA_VALUES``) and a simple (non-guided) denoising
+        function will be used during ``__call__``.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        checkpoint_path: str,
-        gemma_root: str,
+        model_paths: ModelPaths,
         loras: list[LoraPathStrengthAndSDOps],
-        device: torch.device = device,
+        device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
+        registry: Registry | None = None,
+        distilled: bool = True,
+        compilation_config: CompilationConfig | None = None,
+        offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        prompt_enhancer_gemma_root: str | None = None,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ):
-        self.device = device
+        self.device = device or get_device()
         self.dtype = torch.bfloat16
-        self.model_ledger = ModelLedger(
+        self.distilled = distilled
+        if not distilled:
+            self._scheduler = LTX2Scheduler()
+        self.prompt_encoder = PromptEncoder(
+            model_paths,
             dtype=self.dtype,
-            device=device,
-            checkpoint_path=checkpoint_path,
-            gemma_root_path=gemma_root,
-            loras=loras,
-            quantization=quantization,
+            device=self.device,
+            registry=registry,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
+            prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
         )
-        self.pipeline_components = PipelineComponents(
+        self.image_conditioner = ImageConditioner(
+            model_paths.video_vae(),
             dtype=self.dtype,
-            device=device,
+            device=self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.audio_conditioner = AudioConditioner(
+            model_paths.audio_vae(),
+            dtype=self.dtype,
+            device=self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.stage = DiffusionStage.from_checkpoint(
+            model_paths.transformer(),
+            dtype=self.dtype,
+            device=self.device,
+            loras=tuple(loras),
+            quantization=quantization,
+            registry=registry,
+            compilation_config=compilation_config,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.video_decoder = VideoDecoder(
+            model_paths.video_vae(),
+            dtype=self.dtype,
+            device=self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
+        )
+        self.audio_decoder = AudioDecoder(
+            model_paths.audio_vae(),
+            dtype=self.dtype,
+            device=self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
 
     # --------------------------------------------------------------------- #
     #  Public entry point                                                     #
     # --------------------------------------------------------------------- #
 
-    def __call__(  # noqa: PLR0913, PLR0915
+    def __call__(  # noqa: PLR0913
         self,
         video_path: str,
         prompt: str,
@@ -205,6 +155,7 @@ class RetakePipeline:
         end_time: float,
         seed: int,
         *,
+        fps: float | None = None,
         negative_prompt: str = "",
         num_inference_steps: int = 40,
         video_guider_params: MultiModalGuiderParams | None = None,
@@ -212,20 +163,29 @@ class RetakePipeline:
         regenerate_video: bool = True,
         regenerate_audio: bool = True,
         enhance_prompt: bool = False,
-        distilled: bool = False,
-        tiling_config: TilingConfig | None = None,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
+        enhance_static_cache: bool = False,
+        vae_dtype: torch.dtype | None = None,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
+        max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
+        color_space: HDRColorSpace | None = None,
+    ) -> PipelineOutput:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
         ----------
         video_path : str
-            Path to the source video file (must contain video; audio is optional).
+            Path to the source video file, or a directory of scene-linear ``*.exr``
+            frames (native HDR). Audio is optional for video files and absent for
+            EXR folders.
         prompt : str
             Text prompt describing the *regenerated* section.
         start_time, end_time : float
             Time window (in seconds) of the section to regenerate.
         seed : int
             Random seed for reproducibility.
+        fps : float | None
+            Frame rate when *video_path* is an EXR-frame folder (required then).
+            Ignored for regular video files.
         negative_prompt : str
             Negative prompt for CFG guidance (ignored in distilled mode).
         num_inference_steps : int
@@ -235,116 +195,104 @@ class RetakePipeline:
             Guidance parameters for video and audio modalities.  Ignored in
             distilled mode.
         regenerate_video : bool
-            If ``True`` (default), preserve video outside ``[start_time, end_time]``
-            and only regenerate the masked region.  If ``False``, fully regenerate
-            all video frames (the encoded video is still used as the initial latent
-            but with ``denoise_mask = 1`` everywhere).
+            If ``True`` (default), regenerate video inside ``[start_time, end_time]``.
+            If ``False``, video is preserved as-is (no regeneration).
         regenerate_audio : bool
             If True, regenerate audio in the [start_time, end_time] window; if False,
             audio is preserved as-is (no regeneration).
         enhance_prompt : bool
             Whether to enhance the prompt via the text encoder.
-        distilled : bool
-            If ``True``, use the distilled sigma schedule
-            (``DISTILLED_SIGMA_VALUES``) and a simple (non-guided) denoising
-            function.  The model checkpoint must be the distilled variant.
         Returns
         -------
-        tuple[Iterator[torch.Tensor], torch.Tensor]
-            ``(video_frames_iterator, audio_waveform)``
+        PipelineOutput
+            Decoded video, audio, frame count, tiling, ``keyframes=None``, and the
+            video latent used for decode when retained (may be ``None``).
         """
         if start_time >= end_time:
             raise ValueError(f"start_time ({start_time}) must be less than end_time ({end_time})")
 
-        effective_seed = torch.randint(0, 2**31, (1,), device=self.device).item() if seed < 0 else seed
-        generator = torch.Generator(device=self.device).manual_seed(effective_seed)
+        generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
         dtype = self.dtype
+        if vae_dtype is None:
+            vae_dtype = dtype
 
-        video_encoder = self.model_ledger.video_encoder()
+        output_shape = get_videostream_metadata(video_path, fps=fps)
 
-        # Use av to get metadata
-        fps, num_pixel_frames, src_width, src_height = get_videostream_metadata(video_path)
-
-        output_shape = VideoPixelShape(
-            batch=1,
-            frames=num_pixel_frames,
-            width=src_width,
-            height=src_height,
-            fps=fps,
-        )
-        initial_video_latent = _encode_video_for_retake(
-            video_encoder=video_encoder,
-            video_path=video_path,
-            output_shape=output_shape,
-            dtype=dtype,
+        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
+        tiling_config = ensure_tiling_config(
+            tiling_config,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(
+                batch=1,
+                frames=output_shape.frames,
+                height=output_shape.height,
+                width=output_shape.width,
+                fps=output_shape.fps,
+            ),
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
         )
-        video_conditionings: list[ConditioningItem] = [
-            TemporalRegionMask(
-                start_time=start_time if regenerate_video else 0.0,
-                end_time=end_time if regenerate_video else 0.0,
-                fps=fps,
-            )
-        ]
-        del video_encoder
-        cleanup_memory()
 
-        initial_audio_latent: torch.Tensor | None = None
-        audio_conditionings: list[ConditioningItem] = []
-
-        audio_in = decode_audio_from_file(video_path, self.device)
-        audio_encoder = self.model_ledger.audio_encoder()
-
-        if audio_in is not None:
-            waveform = audio_in.waveform.squeeze(0)
-            waveform_sr = audio_in.sampling_rate
-        else:
-            waveform, waveform_sr = None, None
-        if waveform is not None:
-            initial_audio_latent = _encode_audio_for_retake(
-                audio_encoder=audio_encoder,
-                waveform=waveform,
-                waveform_sr=waveform_sr,
+        initial_video_latent = self.image_conditioner(
+            lambda enc: video_latent_from_file(
+                video_encoder=enc,
+                file_path=video_path,
                 output_shape=output_shape,
                 dtype=dtype,
+                device=self.device,
+                color_space=color_space,
             )
-            audio_conditionings = [
-                TemporalRegionMask(
-                    start_time=start_time if regenerate_audio else 0.0,
-                    end_time=end_time if regenerate_audio else 0.0,
-                    fps=fps,
-                )
-            ]
+        )
 
-        del audio_encoder
-        cleanup_memory()
+        initial_audio_latent = self.audio_conditioner(
+            lambda enc: audio_latent_from_file(
+                audio_encoder=enc,
+                file_path=video_path,
+                output_shape=output_shape,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
 
-        prompts_to_encode = [prompt] if distilled else [prompt, negative_prompt]
-        contexts = encode_prompts(
+        prompts_to_encode = [prompt] if self.distilled else [prompt, negative_prompt]
+        contexts = self.prompt_encoder(
             prompts_to_encode,
-            self.model_ledger,
             enhance_first_prompt=enhance_prompt,
-            enhance_prompt_seed=effective_seed,
+            enhance_static_cache=enhance_static_cache,
         )
 
         v_context_p, a_context_p = contexts[0].video_encoding, contexts[0].audio_encoding
-        if not distilled:
-            v_context_n, a_context_n = contexts[1].video_encoding, contexts[1].audio_encoding
+        video_modality_spec = ModalitySpec(
+            context=v_context_p,
+            conditionings=[TemporalRegionMask(start_time=start_time, end_time=end_time, fps=output_shape.fps)]
+            if regenerate_video
+            else [],
+            initial_latent=initial_video_latent,
+            frozen=not regenerate_video,
+        )
+        audio_modality_spec = ModalitySpec(
+            context=a_context_p,
+            conditionings=[TemporalRegionMask(start_time=start_time, end_time=end_time, fps=output_shape.fps)]
+            if (initial_audio_latent is not None and regenerate_audio)
+            else [],
+            initial_latent=initial_audio_latent,
+            frozen=initial_audio_latent is not None and not regenerate_audio,
+        )
 
-        transformer = self.model_ledger.transformer()
+        # Build denoiser and resolve sigma schedule.
+        if sigmas is None:
+            sigmas = DISTILLED_SIGMAS if self.distilled else self._scheduler.execute(steps=num_inference_steps)
+        sigmas = sigmas.to(dtype=torch.float32, device=self.device)
 
-        sigmas = (
-            torch.tensor(DISTILLED_SIGMA_VALUES) if distilled else LTX2Scheduler().execute(steps=num_inference_steps)
-        ).to(dtype=torch.float32, device=self.device)
-        if distilled:
-            denoise_fn = simple_denoising_func(
-                video_context=v_context_p,
-                audio_context=a_context_p,
-                transformer=transformer,
+        if self.distilled:
+            denoiser = SimpleDenoiser(
+                v_context=v_context_p,
+                a_context=a_context_p,
             )
         else:
+            v_context_n, a_context_n = contexts[1].video_encoding, contexts[1].audio_encoding
             video_guider = MultiModalGuider(
                 params=video_guider_params,
                 negative_context=v_context_n,
@@ -353,93 +301,41 @@ class RetakePipeline:
                 params=audio_guider_params,
                 negative_context=a_context_n,
             )
-            denoise_fn = multi_modal_guider_denoising_func(
-                video_guider,
-                audio_guider,
+            denoiser = GuidedDenoiser(
                 v_context=v_context_p,
                 a_context=a_context_p,
-                transformer=transformer,
+                video_guider=video_guider,
+                audio_guider=audio_guider,
             )
 
-        def denoising_loop(
-            sigmas: torch.Tensor,
-            video_state: LatentState,
-            audio_state: LatentState,
-            stepper: DiffusionStepProtocol,
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=denoise_fn,
-            )
-
-        # Build noised states with the encoded latents as initial values and
-        # the temporal masks applied via conditionings.
-        video_state, video_tools = noise_video_state(
-            output_shape=output_shape,
+        # Run diffusion stage
+        video_state, audio_state = self.stage(
+            denoiser=denoiser,
+            sigmas=sigmas,
             noiser=noiser,
-            conditionings=video_conditionings,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            initial_latent=initial_video_latent,
-        )
-        audio_state, audio_tools = noise_audio_state(
-            output_shape=output_shape,
-            noiser=noiser,
-            conditionings=audio_conditionings,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            initial_latent=initial_audio_latent,
+            width=output_shape.width,
+            height=output_shape.height,
+            frames=output_shape.frames,
+            fps=output_shape.fps,
+            video=video_modality_spec,
+            audio=audio_modality_spec,
+            max_batch_size=max_batch_size,
         )
 
-        video_state, audio_state = denoising_loop(sigmas, video_state, audio_state, stepper)
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
+        decoded_audio = self.audio_decoder(audio_state.latent)
 
-        video_state = video_tools.clear_conditioning(video_state)
-        video_state = video_tools.unpatchify(video_state)
-        audio_state = audio_tools.clear_conditioning(audio_state)
-        audio_state = audio_tools.unpatchify(audio_state)
-
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
-
-        decoded_video = vae_decode_video(
-            video_state.latent, self.model_ledger.video_decoder(), tiling_config, generator
+        return PipelineOutput(
+            decoded_video, decoded_audio, output_shape.frames, tiling_config, None, video_state.latent
         )
-        decoded_audio = vae_decode_audio(
-            audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
-        )
-
-        return decoded_video, decoded_audio
 
 
 @torch.inference_mode()
 def main() -> None:
     """CLI entry point for retake (regenerate a time region)."""
-    logging.getLogger().setLevel(logging.INFO)
-    parser = argparse.ArgumentParser(description="Retake: regenerate a time region of a video with LTX-2.")
-    parser.add_argument("--video-path", type=str, required=True, help="Path to the source video.")
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt for the regenerated region.")
-    parser.add_argument("--start-time", type=float, required=True, help="Start time of the region to regenerate (s).")
-    parser.add_argument("--end-time", type=float, required=True, help="End time of the region to regenerate (s).")
-    parser.add_argument("--output-path", type=str, required=True, help="Path for the output video.")
-    parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to the LTX-2 checkpoint.")
-    parser.add_argument("--gemma-root", type=str, required=True, help="Path to Gemma text encoder weights.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed. Use -1 for a random seed.")
-    parser.add_argument("--loras", nargs="*", default=[], help="LoRA paths (optional).")
-    parser.add_argument(
-        "--quantization",
-        dest="quantization",
-        action=QuantizationAction,
-        nargs="+",
-        metavar=("POLICY", "AMAX_PATH"),
-        default=None,
-        help="Quantization policy: fp8-cast or fp8-scaled-mm [AMAX_PATH].",
-    )
+    logging.basicConfig(level=logging.INFO)
+    parser = video_editing_arg_parser(distilled=True)
+    parser.description = "Retake: regenerate a time region of a video with LTX-2."
     args = parser.parse_args()
 
     if args.start_time >= args.end_time:
@@ -447,40 +343,53 @@ def main() -> None:
 
     # Validate frame count (8k+1) and resolution (multiples of 32) at CLI stage
     video_scale = SpatioTemporalScaleFactors.default()
-    fps, num_frames, width, height = get_videostream_metadata(args.video_path)
-    if (num_frames - 1) % video_scale.time != 0:
-        snapped = ((num_frames - 1) // video_scale.time) * video_scale.time + 1
+    exr_input = is_exr_dir(args.video_path)
+    src = get_videostream_metadata(args.video_path, fps=args.frame_rate if exr_input else None)
+    if (src.frames - 1) % video_scale.time != 0:
+        snapped = ((src.frames - 1) // video_scale.time) * video_scale.time + 1
         raise ValueError(
-            f"Video frame count must satisfy 8k+1 (e.g. 97, 193). Got {num_frames}; use a video with {snapped} frames."
+            f"Video frame count must satisfy 8k+1 (e.g. 97, 193). Got {src.frames}; use a video with {snapped} frames."
         )
-    if width % 32 != 0 or height % 32 != 0:
-        raise ValueError(f"Video width and height must be multiples of 32. Got {width}x{height}.")
+    if src.width % 32 != 0 or src.height % 32 != 0:
+        raise ValueError(f"Video width and height must be multiples of 32. Got {src.width}x{src.height}.")
 
     pipeline = RetakePipeline(
-        checkpoint_path=args.checkpoint_path,
-        gemma_root=args.gemma_root,
-        loras=tuple(args.loras) if args.loras else (),
+        model_paths=args.model_paths,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
+        distilled=True,
+        compilation_config=args.compile,
+        offload_mode=args.offload_mode,
+        prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
+        diffvae_optimization=args.diffvae_optimization,
     )
-    params = detect_params(args.checkpoint_path)
-    tiling_config = TilingConfig.default()
-    video_iter, audio = pipeline(
+    params = detect_params(args.model_paths.transformer())
+    hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
+    vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
+    result = pipeline(
         video_path=args.video_path,
         prompt=args.prompt,
         start_time=args.start_time,
         end_time=args.end_time,
         seed=args.seed,
+        fps=args.frame_rate if exr_input else None,
+        enhance_prompt=args.enhance_prompt,
+        enhance_static_cache=args.enhance_static_cache,
         video_guider_params=params.video_guider_params,
         audio_guider_params=params.audio_guider_params,
-        tiling_config=tiling_config,
+        vae_dtype=vae_dtype,
+        color_space=hdr,
+        tiling_config=AUTO_TILING,
+        max_batch_size=args.max_batch_size,
     )
-    video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+
     encode_video(
-        video=video_iter,
-        fps=int(fps),
-        audio=audio,
+        video=result.video,
+        fps=int(src.fps),
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+        color_space=hdr,
     )
 
 

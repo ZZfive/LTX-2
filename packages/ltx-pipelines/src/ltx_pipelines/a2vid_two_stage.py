@@ -1,40 +1,58 @@
+import argparse
 import logging
-from collections.abc import Iterator
 
 import torch
 
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
+from ltx_core.loader.registry import Registry
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
-from ltx_core.model.upsampler import upsample_video
-from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
-from ltx_core.model.video_vae import decode_video as vae_decode_video
+from ltx_core.model.transformer.compiling import CompilationConfig
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoPixelShape
-from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.args import default_2_stage_arg_parser
-from ltx_pipelines.utils.constants import (
-    STAGE_2_DISTILLED_SIGMA_VALUES,
+from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
+from ltx_pipelines.utils.args import (
+    ImageConditioningInput,
+    default_2_stage_arg_parser,
+    resolve_cli_params,
 )
+from ltx_pipelines.utils.blocks import (
+    AudioConditioner,
+    DiffusionStage,
+    ImageConditioner,
+    PromptEncoder,
+    VideoDecoder,
+    VideoUpsampler,
+)
+from ltx_pipelines.utils.constants import (
+    STAGE_2_DISTILLED_SIGMAS,
+    PipelineParams,
+)
+from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
-    cleanup_memory,
+    audio_duration_seconds,
     combined_image_conditionings,
-    denoise_video_only,
-    encode_prompts,
+    ensure_tiling_config,
     get_device,
-    multi_modal_guider_denoising_func,
-    simple_denoising_func,
+    num_frames_from_audio_duration,
+    tiling_scale_factors_for_vae,
 )
-from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
-from ltx_pipelines.utils.samplers import euler_denoising_loop
-from ltx_pipelines.utils.types import PipelineComponents
+from ltx_pipelines.utils.media_io import (
+    HDRColorSpace,
+    decode_audio_from_file,
+    encode_video,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
+)
+from ltx_pipelines.utils.model_paths import ModelPaths
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
-device = get_device()
+logger = logging.getLogger(__name__)
 
 
 class A2VidPipelineTwoStage:
@@ -43,38 +61,91 @@ class A2VidPipelineTwoStage:
     Stage 1 generates video at half the target resolution with audio conditioning
     (video-only denoising, audio frozen), then Stage 2 upsamples by 2x and refines
     both video and audio using a distilled LoRA for higher quality output.
+    When ``num_frames`` is omitted, the frame count is derived from the effective
+    conditioning-audio duration (``min(audio_max_duration, remaining audio after
+    audio_start_time)``) at ``frame_rate``, snapped to the VAE temporal grid.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        checkpoint_path: str,
+        model_paths: ModelPaths,
         distilled_lora: list[LoraPathStrengthAndSDOps],
         spatial_upsampler_path: str,
-        gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
-        device: torch.device = device,
+        device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
+        registry: Registry | None = None,
+        compilation_config: CompilationConfig | None = None,
+        offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        prompt_enhancer_gemma_root: str | None = None,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ):
-        self.device = device
+        self.device = device or get_device()
         self.dtype = torch.bfloat16
+        self._scheduler = LTX2Scheduler()
 
-        self.stage_1_model_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=device,
-            checkpoint_path=checkpoint_path,
-            gemma_root_path=gemma_root,
-            spatial_upsampler_path=spatial_upsampler_path,
-            loras=loras,
+        self.prompt_encoder = PromptEncoder(
+            model_paths,
+            self.dtype,
+            self.device,
+            registry=registry,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
+            prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
+        )
+        self.image_conditioner = ImageConditioner(
+            model_paths.video_vae(),
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.audio_conditioner = AudioConditioner(
+            model_paths.audio_vae(),
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.stage_1 = DiffusionStage.from_checkpoint(
+            model_paths.transformer(),
+            self.dtype,
+            self.device,
+            loras=tuple(loras),
             quantization=quantization,
+            registry=registry,
+            compilation_config=compilation_config,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-
-        self.stage_2_model_ledger = self.stage_1_model_ledger.with_additional_loras(
-            loras=distilled_lora,
+        stage_2_loras = (*tuple(loras), *tuple(distilled_lora))
+        self.stage_2 = DiffusionStage.from_checkpoint(
+            model_paths.transformer(),
+            self.dtype,
+            self.device,
+            loras=stage_2_loras,
+            quantization=quantization,
+            registry=registry,
+            compilation_config=compilation_config,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-
-        self.pipeline_components = PipelineComponents(
-            dtype=self.dtype,
-            device=device,
+        self.upsampler = VideoUpsampler(
+            model_paths.video_vae(),
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.video_decoder = VideoDecoder(
+            model_paths.video_vae(),
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
         )
 
     def __call__(  # noqa: PLR0913
@@ -84,41 +155,71 @@ class A2VidPipelineTwoStage:
         seed: int,
         height: int,
         width: int,
-        num_frames: int,
+        num_frames: int | None,
         frame_rate: float,
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
-        images: list[tuple[str, int, float]],
+        images: list[ImageConditioningInput],
         audio_path: str,
         audio_start_time: float = 0.0,
         audio_max_duration: float | None = None,
-        tiling_config: TilingConfig | None = None,
+        vae_dtype: torch.dtype | None = None,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
         enhance_prompt: bool = False,
-    ) -> tuple[Iterator[torch.Tensor], Audio]:
+        enhance_static_cache: bool = False,
+        max_batch_size: int = 1,
+        stage_1_sigmas: torch.Tensor | None = None,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
+        color_space: HDRColorSpace | None = None,
+    ) -> PipelineOutput:
+        images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
+        if vae_dtype is None:
+            vae_dtype = dtype
 
-        ctx_p, ctx_n = encode_prompts(
+        # Decode audio first so the frame count can follow the effective clip length
+        # (``audio_max_duration`` capped by remaining audio after ``audio_start_time``).
+        decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
+        if decoded_audio is None:
+            raise ValueError(f"Failed to decode audio from {audio_path}. Please check the file and try again.")
+        if num_frames is None:
+            num_frames = num_frames_from_audio_duration(decoded_audio, frame_rate=frame_rate)
+            logger.info(
+                "Derived num_frames=%d from %.2fs of audio @ %.2f fps",
+                num_frames,
+                audio_duration_seconds(decoded_audio),
+                frame_rate,
+            )
+
+        ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
-            self.stage_1_model_ledger,
             enhance_first_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
 
-        # Encode audio.
-        decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
-        encoded_audio_latent = vae_encode_audio(decoded_audio, self.stage_1_model_ledger.audio_encoder())
+        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
+        tiling_config = ensure_tiling_config(
+            tiling_config,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+        )
+
+        encoded_audio_latent = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
         encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
 
-        # Stage 1: encode image conditionings with the VAE encoder, then free it
-        # before loading the transformer to reduce peak VRAM.
+        # Stage 1: encode image conditionings with the VAE encoder, then denoise
+        # video-only (audio frozen).
         stage_1_output_shape = VideoPixelShape(
             batch=1,
             frames=num_frames,
@@ -126,134 +227,137 @@ class A2VidPipelineTwoStage:
             height=height // 2,
             fps=frame_rate,
         )
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        stage_1_conditionings = combined_image_conditionings(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
-        torch.cuda.synchronize()
-        del video_encoder
-        cleanup_memory()
-
-        transformer = self.stage_1_model_ledger.transformer()
-        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
-
-        def first_stage_denoising_loop(
-            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=multi_modal_guider_denoising_func(
-                    video_guider=MultiModalGuider(
-                        params=video_guider_params,
-                        negative_context=v_context_n,
-                    ),
-                    audio_guider=MultiModalGuider(
-                        params=MultiModalGuiderParams(),
-                    ),
-                    v_context=v_context_p,
-                    a_context=a_context_p,
-                    transformer=transformer,  # noqa: F821
-                ),
+        stage_1_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+                color_space=color_space,
             )
-
-        video_state = denoise_video_only(
-            output_shape=stage_1_output_shape,
-            conditionings=stage_1_conditionings,
-            noiser=noiser,
-            sigmas=sigmas,
-            stepper=stepper,
-            denoising_loop_fn=first_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            initial_audio_latent=encoded_audio_latent,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        sigmas = (
+            stage_1_sigmas if stage_1_sigmas is not None else self._scheduler.execute(steps=num_inference_steps)
+        ).to(dtype=torch.float32, device=self.device)
+
+        video_state, _ = self.stage_1(
+            denoiser=GuidedDenoiser(
+                v_context=v_context_p,
+                a_context=a_context_p,
+                video_guider=MultiModalGuider(
+                    params=video_guider_params,
+                    negative_context=v_context_n,
+                ),
+                audio_guider=MultiModalGuider(
+                    params=MultiModalGuiderParams(),
+                ),
+            ),
+            sigmas=sigmas,
+            noiser=noiser,
+            width=stage_1_output_shape.width,
+            height=stage_1_output_shape.height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_1_conditionings,
+            ),
+            audio=ModalitySpec(
+                context=a_context_p,
+                frozen=True,
+                noise_scale=0.0,
+                initial_latent=encoded_audio_latent,
+            ),
+            max_batch_size=max_batch_size,
+        )
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        upscaled_video_latent = upsample_video(
-            latent=video_state.latent[:1],
-            video_encoder=video_encoder,
-            upsampler=self.stage_2_model_ledger.spatial_upsampler(),
-        )
+        upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = combined_image_conditionings(
-            images=images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
-        del video_encoder
-        torch.cuda.synchronize()
-        cleanup_memory()
-
-        transformer = self.stage_2_model_ledger.transformer()
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
-
-        def second_stage_denoising_loop(
-            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=v_context_p,
-                    audio_context=a_context_p,
-                    transformer=transformer,  # noqa: F821
-                ),
+        stage_2_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+                color_space=color_space,
             )
+        )
 
-        video_state = denoise_video_only(
-            output_shape=stage_2_output_shape,
-            conditionings=stage_2_conditionings,
+        video_state, _ = self.stage_2(
+            denoiser=SimpleDenoiser(v_context_p, a_context_p),
+            sigmas=stage_2_sigmas,
             noiser=noiser,
-            sigmas=distilled_sigmas,
-            stepper=stepper,
-            denoising_loop_fn=second_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            noise_scale=distilled_sigmas[0],
-            initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=encoded_audio_latent,
+            width=width,
+            height=height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_2_conditionings,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=upscaled_video_latent,
+            ),
+            audio=ModalitySpec(
+                context=a_context_p,
+                frozen=True,
+                noise_scale=0.0,
+                initial_latent=encoded_audio_latent,
+            ),
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
-
-        decoded_video = vae_decode_video(
-            video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
-        )
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
 
         # Return the original input audio instead of VAE-decoded audio to preserve fidelity.
         # decode_audio_from_file already returns normalised [-1, 1] float values.
-        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
+        # Trim to the snapped video duration so a slightly longer clip cannot freeze
+        # the last frames. Floor so a half-sample leftover cannot outlast the video.
+        video_samples = max(1, int((num_frames / frame_rate) * decoded_audio.sampling_rate))
+        original_audio = Audio(
+            waveform=decoded_audio.waveform.squeeze(0)[..., :video_samples],
+            sampling_rate=decoded_audio.sampling_rate,
+        )
 
-        return decoded_video, original_audio
+        return PipelineOutput(decoded_video, original_audio, num_frames, tiling_config, None, video_state.latent)
 
 
-@torch.inference_mode()
-def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
-    parser = default_2_stage_arg_parser()
+def resolve_a2vid_cli_duration(
+    *,
+    num_frames: int | None,
+    audio_max_duration: float | None,
+    frame_rate: float,
+    default_num_frames: int,
+) -> tuple[int | None, float]:
+    """Pick the single duration driver for the A2Vid CLI.
+    ``--num-frames`` and ``--audio-max-duration`` are mutually exclusive. Returns
+    ``(num_frames_for_pipeline, audio_max_duration)``:
+    * only ``--audio-max-duration``: ``num_frames`` is ``None`` so the pipeline derives
+      frames from the decoded clip (capped by remaining audio after start time).
+    * only ``--num-frames``, or neither: use that frame count (defaulting to
+      ``default_num_frames``) and clip audio to ``num_frames / frame_rate``.
+    """
+    if num_frames is not None and audio_max_duration is not None:
+        raise ValueError("argument --num-frames: not allowed with argument --audio-max-duration")
+    if audio_max_duration is not None:
+        return None, audio_max_duration
+    frames = default_num_frames if num_frames is None else num_frames
+    return frames, frames / frame_rate
+
+
+def build_a2vid_arg_parser(params: PipelineParams) -> argparse.ArgumentParser:
+    """Two-stage parser plus A2Vid audio flags; ``--num-frames`` default is unset.
+    Leaving ``--num-frames`` as ``None`` when omitted is what lets
+    ``resolve_a2vid_cli_duration`` tell "user passed --audio-max-duration" apart from
+    "user passed both" (the shared parser would otherwise fill in ``params.num_frames``).
+    """
+    parser = default_2_stage_arg_parser(params=params)
     parser.add_argument(
         "--audio-path",
         type=str,
@@ -270,26 +374,73 @@ def main() -> None:
         "--audio-max-duration",
         type=float,
         default=None,
-        help="Maximum audio duration in seconds. Defaults to video duration (num_frames / frame_rate).",
+        help=(
+            "Maximum audio duration in seconds, measured from --audio-start-time. "
+            "The video length is derived from the effective clip "
+            "(this value capped by remaining audio in the file) at --frame-rate. "
+            "Mutually exclusive with --num-frames. "
+            f"If neither is given, audio is clipped to the default "
+            f"--num-frames / --frame-rate ({params.num_frames} frames)."
+        ),
     )
+    for action in parser._actions:
+        if "--num-frames" in action.option_strings:
+            action.default = None
+            action.help = (
+                "Number of frames to generate, num_frames = 8 * k + 1 "
+                f"(default: {params.num_frames}). Mutually exclusive with --audio-max-duration; "
+                "when set, audio is clipped to this length / --frame-rate."
+            )
+            break
+    return parser
+
+
+def resolve_a2vid_duration_or_exit(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    default_num_frames: int,
+) -> tuple[int | None, float]:
+    """Resolve duration knobs, or ``parser.error`` if both flags were given."""
+    try:
+        return resolve_a2vid_cli_duration(
+            num_frames=args.num_frames,
+            audio_max_duration=args.audio_max_duration,
+            frame_rate=args.frame_rate,
+            default_num_frames=default_num_frames,
+        )
+    except ValueError as e:
+        parser.error(str(e))
+        raise  # parser.error always exits; keep the type checker happy
+
+
+@torch.inference_mode()
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    params = resolve_cli_params()
+    parser = build_a2vid_arg_parser(params)
     args = parser.parse_args()
+    num_frames, audio_max_duration = resolve_a2vid_duration_or_exit(parser, args, default_num_frames=params.num_frames)
     pipeline = A2VidPipelineTwoStage(
-        checkpoint_path=args.checkpoint_path,
+        model_paths=args.model_paths,
         distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
-        gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
+        compilation_config=args.compile,
+        offload_mode=args.offload_mode,
+        prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
+        diffvae_optimization=args.diffvae_optimization,
     )
-    tiling_config = TilingConfig.default()
-    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
-    video, audio = pipeline(
+    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
+    vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
+    result = pipeline(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
         height=args.height,
         width=args.width,
-        num_frames=args.num_frames,
+        num_frames=num_frames,
         frame_rate=args.frame_rate,
         num_inference_steps=args.num_inference_steps,
         video_guider_params=MultiModalGuiderParams(
@@ -301,21 +452,23 @@ def main() -> None:
             stg_blocks=args.video_stg_blocks,
         ),
         images=args.images,
-        tiling_config=tiling_config,
+        vae_dtype=vae_dtype,
+        color_space=hdr,
+        tiling_config=AUTO_TILING,
         enhance_prompt=args.enhance_prompt,
+        enhance_static_cache=args.enhance_static_cache,
         audio_path=args.audio_path,
         audio_start_time=args.audio_start_time,
-        audio_max_duration=args.audio_max_duration
-        if args.audio_max_duration is not None
-        else args.num_frames / args.frame_rate,
+        audio_max_duration=audio_max_duration,
+        max_batch_size=args.max_batch_size,
     )
-
     encode_video(
-        video=video,
+        video=result.video,
         fps=args.frame_rate,
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+        color_space=hdr,
     )
 
 
