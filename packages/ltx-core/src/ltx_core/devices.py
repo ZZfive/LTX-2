@@ -17,7 +17,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-DeviceSpec = torch.device | None
+DeviceSpec = torch.device | None  # 设备规范
 
 
 def is_mps_available() -> bool:
@@ -33,9 +33,9 @@ def get_preferred_device(local_rank: int | None = None) -> torch.device:
     """
     if torch.cuda.is_available():
         index = torch.cuda.current_device() if local_rank is None else local_rank
-        return torch.device("cuda", index)
+        return torch.device("cuda", index)  # 返回 CUDA 设备
     if is_mps_available():
-        return torch.device("mps")
+        return torch.device("mps")  # 返回 MPS 设备
     return torch.device("cpu")
 
 
@@ -50,7 +50,7 @@ def supports_float64(device: DeviceSpec) -> bool:
     """Return whether *device* can represent ``torch.float64``.
     MPS has no double-precision support; CUDA and CPU do.
     """
-    return resolve_device(device).type != "mps"
+    return resolve_device(device).type != "mps"  # mps不支持float64
 
 
 def highest_precision_float(device: DeviceSpec) -> torch.dtype:
@@ -65,9 +65,9 @@ def highest_precision_float(device: DeviceSpec) -> torch.dtype:
 def synchronize_device(device: DeviceSpec = None) -> None:
     """Synchronize CUDA or MPS work if the selected backend supports it."""
     resolved = resolve_device(device)
-    if resolved.type == "cuda" and torch.cuda.is_available():
+    if resolved.type == "cuda" and torch.cuda.is_available():  # 如果设备是 CUDA 并且 CUDA 可用
         torch.cuda.synchronize(resolved)
-    elif resolved.type == "mps" and is_mps_available():
+    elif resolved.type == "mps" and is_mps_available():  # 如果设备是 MPS 并且 MPS 可用
         torch.mps.synchronize()
 
 
@@ -80,24 +80,24 @@ def empty_device_cache(device: DeviceSpec = None) -> None:
         torch.mps.empty_cache()
 
 
-def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
+def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:  # 估算当前进程在执行CUDA设备上，还可以安全用于新激活张量分配的现存大小，单位是字节
     """Bytes still available for new CUDA allocations in this process.
     Honors ``torch.cuda.set_per_process_memory_fraction``: ``mem_get_info`` reports
     raw device free memory and does *not* shrink under a fraction cap, so we use
     ``fraction * device_total - memory_reserved`` (also capped by raw free).
     """
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available():  # 如果 CUDA 不可用
         return 0
     resolved = resolve_device(device)
-    if resolved.type != "cuda":
+    if resolved.type != "cuda":  # 如果设备不是 CUDA
         return 0
-    idx = resolved.index if resolved.index is not None else torch.cuda.current_device()
-    free_raw, _total_raw = torch.cuda.mem_get_info(idx)
-    props_total = torch.cuda.get_device_properties(idx).total_memory
+    idx = resolved.index if resolved.index is not None else torch.cuda.current_device()  # 获取设备索引
+    free_raw, _total_raw = torch.cuda.mem_get_info(idx)  # 获取设备剩余可用现存和总现存
+    props_total = torch.cuda.get_device_properties(idx).total_memory  # 获取设备总内存
     fraction = torch.cuda.get_per_process_memory_fraction(idx)
     reserved = torch.cuda.memory_reserved(idx)
-    under_fraction = max(0, int(fraction * props_total) - int(reserved))
-    return min(int(free_raw), under_fraction)
+    under_fraction = max(0, int(fraction * props_total) - int(reserved))  # 计算当前进程在执行CUDA设备上，还可以安全用于新激活张量分配的现存大小，单位是字节
+    return min(int(free_raw), under_fraction)  # 返回当前进程在执行CUDA设备上，还可以安全用于新激活张量分配的现存大小，单位是字节
 
 
 def mps_activation_budget_bytes(device: DeviceSpec = None) -> int:
@@ -140,11 +140,11 @@ def activation_budget_bytes(device: DeviceSpec = None) -> int:
 
 def cleanup_accelerator_memory(device: DeviceSpec = None) -> None:
     """Run Python GC and release CUDA/MPS allocator caches."""
-    gc.collect()
-    empty_device_cache(device)
-    synchronize_device(device)
+    gc.collect()  # 运行Python垃圾回收器，释放未使用的内存
+    empty_device_cache(device)  # 清空设备缓存
+    synchronize_device(device)  # 同步设备
     try:
-        if hasattr(torch._C, "_host_emptyCache"):
-            torch._C._host_emptyCache()
+        if hasattr(torch._C, "_host_emptyCache"):  # 如果torch._C有_host_emptyCache属性
+            torch._C._host_emptyCache()  # 清空主机缓存
     except Exception:
-        logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+        logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)  # 主机缓存清理失败，忽略
